@@ -1,0 +1,1652 @@
+---
+title: "Did Benfica play like Spurs?"
+author: "Aditya Kothari"
+output: html_document
+---
+
+# {.tabset .tabset-fade .tabset-pills}
+
+## Introduction
+
+I was fascinated by the story about Liverpool choosing to train with the Benfica B team to prepare for the UCL 2019 final because the club analysed and decided Benfica play very similarly to Spurs, Liverpool's opponents in the final. I don't have data from Benfica's B team but I'm going to take Benfica's A team as a proxy and evaluate the similarities based on the A team's games.
+
+## Methodology
+
+I thought it would be an interesting exercise to see what the results of <a href = "https://thecomeonman.github.io/SpatialSimilaritiesBetweenPlayers/">my playing methodology similarity</a> would be for this.
+
+However, I chose to employ a variant of my methodology here because I've been meaning to try it out. Instead of calculating four distances for player from the four sets of points of where the player received the ball from, received the ball at, passed from, and passed to, I now calculate three distances for each player from the three sets of line segments, the received pass, the movement from the receipt to the next pass, and the final pass. With this tweak, I am able to incorporate the interaction that these pairs of locations obviously have which should be an improvement over the previous distance measure where these four sets of coordinates were treated completely independently.
+
+Since this method focusses on passing, it captures the style of attack more than the style of defense. This analysis will therefore also be about the similarity in the way the two teams attack.
+
+```{r Setup, cache=FALSE, echo=FALSE, warning=FALSE, message=FALSE, fig.width = 15, fig.height = 8, results = 'hide'}
+   
+rm(list = ls())
+
+library(data.table)
+library(emdist)
+library(snow)
+library(snowfall)
+library(ggplot2)
+library(scales)
+library(knitr)
+library(clue)
+library(CodaBonito)
+library(lpSolveAPI)
+theme_set(theme_bw(12))
+
+knitr::knit_meta(class=NULL, clean = TRUE)
+options(knitr.duplicate.label = 'allow')
+
+```
+
+```{r ParametersFunctions, cache=FALSE, echo=FALSE, warning=FALSE, message=FALSE, fig.width = 15, fig.height = 8, results = 'asis'}
+
+cPostCodeFolderLocation = '/media/ask/Data/Personal/Projects/Personal/AnalysingFootballData/EMDRelated/'
+cPostDataFolderLocation = '/media/ask/Data/Personal/Projects/Personal/NoSuchThingAs4231'
+
+source(paste0(cPostCodeFolderLocation, '/Common.R'))
+# read_chunk(paste0(cPostCodeFolderLocation, '/CommonChunksTransfers.R'))
+
+cTeamName = 'Tottenham'
+
+dtFormationSlotNames = data.table(
+   formationName = '4231',
+   formationSlots = 1:11,
+   position = c('GK','RB','LB','LCM','RCB','LCB','RW','RCM','FWD','CAM','LW')
+)
+
+dtFormationSlotNames[, position := factor(position, levels = c('GK','RB','RCB','LCB','LB','RCM','LCM','RW','CAM','LW','FWD'), ordered = T)]
+
+
+```
+
+
+
+```{r DataLoading, cache=FALSE, echo=FALSE, warning=FALSE, message=FALSE, fig.width = 15, fig.height = 8, results = 'asis'}
+
+load(paste0(
+   cPostDataFolderLocation,
+   '/Data/FormationMatchingData/ProcessedData.Rdata'
+))
+
+iTeamId = dtMatches[teamName == cTeamName, teamId[1]]
+
+
+# rm(dtPasses)
+# dtSNOMapping = dtPasses[, list(SNO = SNO[1]), list(matchId = matchId, teamId = teamId)]
+# rm(dtPasses)
+# rm(dtPlayers)
+# rm(dtFormationDetails)
+# rm(dtFormationSets)
+
+
+load(
+   paste0(
+      cPostDataFolderLocation,
+      '/Data/FormationMatchingData/DistanceFileNames.Rdata'
+   )
+)
+
+# each file has all distances for matches below it
+# so we basically get all matches with SNO >= min(spurs matches SNO)
+dtDistanceSummary = rbindlist(
+   lapply(
+      dtDistanceFileNames[teamId1 %in% iTeamId, rev(sort(unique(SNO2)))],
+      function ( iSNO2 ) {
+
+         # print(iSNO2)
+         # print(Sys.time())
+
+         cTempFile = paste0(
+            cAllMatchDistanceFolderName,
+            '/', 
+            dtSNOMapping[
+               SNO == iSNO2,
+               paste0(
+                  matchId, '_', teamId
+               )
+            ],
+            '.Rdata'
+         )
+         
+         # if ( !file.exists(cTempFile) ) {
+         #    return ( data.table()) 
+         # }
+
+         load(cTempFile)
+
+         # dtDistanceSummary[, c('DistancePassToXY','DistancePassXYSummary','DistanceReceiveAtXYSummary','DistanceReceiveFromXY') := NULL]
+
+         # dtDistanceSummary = dtDistanceSummary[!is.infinite(Distance) & !is.na(Distance)]
+
+         # dtDistanceSummary[Match == T, MatchDistance := Distance]
+         # dtDistanceSummary[Match == F, MatchDistance := 1000000]
+
+         dtDistanceSummary = merge(
+            dtDistanceSummary,
+            dtSNOMapping[, list(SNO1 = SNO[1]), list(matchId1 = matchId, teamId1 = teamId)],
+            c('teamId1','matchId1'),
+            all.x = T
+         )
+
+         dtDistanceSummary = merge(
+            dtDistanceSummary,
+            dtSNOMapping[, list(SNO2 = SNO[1]), list(matchId2 = matchId, teamId2 = teamId)],
+            c('teamId2','matchId2'),
+            all.x = T
+         )
+
+         dtDistanceSummary = dtDistanceSummary[
+            SNO1 %in% dtSNOMapping[teamId %in% iTeamId, unique(SNO)] |
+            SNO2 %in% dtSNOMapping[teamId %in% iTeamId, unique(SNO)]
+         ]
+         
+         dtDistanceSummary
+
+      }
+   ),
+   fill = T
+)
+
+rm(dtDistanceFileNames)
+
+```
+
+
+
+```{r DataFiltering, cache=FALSE, echo=FALSE, warning=FALSE, message=FALSE, fig.width = 15, fig.height = 8, results = 'asis'}
+
+
+viTeamSNOs = dtSNOMapping[
+   matchId %in% dtFormationSets[formationName == 4231][teamId == iTeamId][, sort(unique(matchId))]
+][
+   teamId %in% c(iTeamId)
+][
+   Tournament %in% c(
+      "EPL201819", 
+      "UCLKO201819","UCLGroup201819",
+      ""
+   )
+][,
+   unique(SNO)
+]
+
+
+dtDistanceSummary = rbind(
+   dtDistanceSummary[
+      SNO1 %in% viTeamSNOs &
+      !(SNO2 %in% viTeamSNOs),
+      list(
+         playerId1 = playerId1,
+         playerId2 = playerId2,
+         SNO1 = SNO1,
+         SNO2 = SNO2,
+         Distance,
+         Match
+      )
+   ],
+   dtDistanceSummary[      
+      SNO2 %in% viTeamSNOs &
+      !(SNO1 %in% viTeamSNOs),
+      list(
+         playerId1 = playerId2,
+         playerId2 = playerId1,
+         SNO1 = SNO2,
+         SNO2 = SNO1,
+         Distance,
+         Match
+         # DistanceReceiveFromXY,
+         # DistanceReceiveAtXYSummary,
+         # DistancePassXYSummary,
+         # DistancePassToXY
+      )
+   ],
+   dtDistanceSummary[
+      SNO2 %in% viTeamSNOs &
+      SNO1 %in% viTeamSNOs,
+      list(
+         playerId1 = playerId1,
+         playerId2 = playerId2,
+         SNO1 = SNO1,
+         SNO2 = SNO2,
+         Distance,
+         Match
+      )
+   ],
+   dtDistanceSummary[
+      SNO2 %in% viTeamSNOs &
+      SNO1 %in% viTeamSNOs &
+      SNO1 != SNO2, # it gets counted in the earlier datset so shouldn't double count
+      list(
+         playerId1 = playerId2,
+         playerId2 = playerId1,
+         SNO1 = SNO2,
+         SNO2 = SNO1,
+         Distance,
+         Match
+         # DistanceReceiveFromXY,
+         # DistanceReceiveAtXYSummary,
+         # DistancePassXYSummary,
+         # DistancePassToXY
+      )
+   ],
+   fill = T
+)
+
+
+# dtDistanceSummary[, DistancePassesMade := ( (DistancePassToXY ^ 2) + (DistancePassXYSummary ^ 2)) ^ 0.5]
+
+# dtPlayers[, name := gsub(x = name, pattern = '[[:digit:]]', replacement = '')]
+dtPlayers[
+   name %in% dtPlayers[, length(unique(playerId)), name][V1 > 1, name],
+   name := paste0(name, sapply(playerId, function(x) which(x == unique(playerId)))),
+   name
+]
+      
+dtDistanceSummary = merge(
+   dtDistanceSummary,
+   merge(
+      dtSNOMapping[, list(SNO2 = SNO, teamId2 = teamId, matchId2 = matchId, Tournament2 = Tournament)],
+      dtPlayers[, list(name2 = name, playerId2 = playerId, teamId2 = teamId, matchId2 = matchId)],
+      c('matchId2','teamId2')
+   )[,
+      list(name2, playerId2, Tournament2, SNO2)
+   ],
+   c('playerId2', 'SNO2')
+)
+
+dtDistanceSummary = merge(
+   dtDistanceSummary,
+   merge(
+      dtSNOMapping[, list(matchId2 = matchId, teamId2 = teamId, SNO2 = SNO)],
+      dtMatches[, list(matchId2 = as.integer(matchId), teamId2 = as.integer(teamId), teamName2 = teamName)],
+      c('matchId2','teamId2')
+   )[, list(SNO2, teamName2)],
+   c('SNO2')     
+)
+
+
+dtDistanceSummary = merge(
+   dtDistanceSummary,
+   dtSNOMapping[, list(SNO1 = SNO, matchId1 = matchId, teamId1 = teamId)],
+   'SNO1'
+)
+
+dtDistanceSummary = merge(
+   dtDistanceSummary,
+   dtSNOMapping[, list(SNO2 = SNO, matchId2 = matchId, teamId2 = teamId)],
+   'SNO2'
+)
+
+```
+
+
+## Spurs Baseline
+
+To begin with, we have to establish a baseline Spurs playing style. 
+
+( Note, for simplicity's sake in this whole post I consider only matches where the team played at least 60 minutes with the same 11 people on the pitch in the same formation. If you find some matches missing, it's probably because they violate this condition. )
+
+The duration during which different formations were employed by Spurs during the 2018/19 season -
+
+```{r WhichFormationsHowMuch, cache=FALSE, echo=FALSE, warning=FALSE, message=FALSE, fig.width = 15, fig.height = 8, results = 'asis'}
+
+print(kable(
+   dtFormationSets[
+      matchId %in% dtSNOMapping[
+         Tournament %in% c(
+            "EPL201819",
+            "UCLKO201819","UCLGroup201819",
+            ""
+         ), 
+         matchId
+      ]
+   ][
+      teamId == iTeamId
+   ][, 
+      list(
+         minutesPlayed = endMinuteExpanded - startMinuteExpanded
+      ), 
+      list(
+         formationName, teamId, matchId
+      )
+   ][, 
+      list(minutesPlayed = sum(minutesPlayed)), 
+      formationName
+   ][
+      rev(order(minutesPlayed))
+   ]
+))
+
+```
+
+More specifically, in the UCL the formations employed by Spurs were - 
+
+```{r WhichFormationsHowMuchUCL, cache=FALSE, echo=FALSE, warning=FALSE, message=FALSE, fig.width = 15, fig.height = 8, results = 'asis'}
+
+# dtFormationSets[teamId == iTeamId][, sum(endMinuteExpanded - startMinuteExpanded), formationName][order(V1)]
+print(kable(
+   merge(
+      merge(
+         dtFormationSets[
+            teamId == iTeamId
+         ][, 
+            list(minutesPlayed = endMinuteExpanded - startMinuteExpanded), 
+            list(formationName, teamId, matchId)
+         ],
+         dtSNOMapping[grepl(x = Tournament, pattern = 'UCL.*2018'), list(teamId, matchId, Tournament)],
+         c('teamId', 'matchId')
+      ),
+      dtMatches[, list(teamId = oppositionTeamId, matchId = matchId, oppositionTeamName = teamName, Where = WhereOpposition)],
+      c('teamId','matchId')
+   )[,
+      list(
+         formationName,
+         minutesPlayed,
+         Tournament,
+         oppositionTeamName,
+         Where
+      )
+   ]
+))
+
+```
+
+4-2-3-1 has a large share during the entire season, and even more so during the EPL. Now that the UCL finals have happened we also know that 4-2-3-1 is the formation Spurs chose to play in the finals against Liverpool as well. I feel it would be okay to take the 4-2-3-1 games as the baseline.
+
+I narrowed the list of games I will consider as the basline for Spurs to the matches in which the team played a 4-2-3-1. Here are the matches that will get considered -
+
+```{r WhichMatches4231, cache=FALSE, echo=FALSE, warning=FALSE, message=FALSE, fig.width = 15, fig.height = 8, results = 'asis'}
+
+# dtFormationSets[teamId == iTeamId][, sum(endMinuteExpanded - startMinuteExpanded), formationName][order(V1)]
+print(kable(
+   merge(
+      merge(
+         dtFormationSets[
+            matchId %in% dtSNOMapping[
+               Tournament %in% c(
+                  "EPL201819",
+                  "UCLKO201819","UCLGroup201819",
+                  ""
+               ), 
+               matchId
+            ]
+         ][
+            formationName == '4231'
+         ][
+            teamId == iTeamId
+         ][, 
+            list(minutesPlayed = endMinuteExpanded - startMinuteExpanded), 
+            list(formationName, teamId, matchId)
+         ],
+         dtSNOMapping[, list(teamId, matchId, Tournament)],
+         c('teamId', 'matchId')
+      ),
+      dtMatches[, list(teamId = oppositionTeamId, matchId = matchId, oppositionTeamName = teamName, Where = WhereOpposition)],
+      c('teamId','matchId')
+   )[,
+      list(
+         Tournament, oppositionTeamName, Where, minutesPlayed
+      )
+   ]
+))
+
+
+```
+
+In these matches, the players and the number of appearances they made are as follows -
+
+```{r TeamComposition, cache=FALSE, echo=FALSE, warning=FALSE, message=FALSE, fig.width = 15, fig.height = 8, results = 'asis'}
+
+print(kable(
+   merge(
+      merge(
+          merge(
+               merge(
+                  dtDistanceSummary[
+                     teamId1 == iTeamId
+                  ][,
+                     .SD[1],
+                     list(
+                        SNO1, playerId1
+                     )
+                  ],
+                  dtFormationDetails[, list(matchId1 = matchId, teamId1 = teamId, playerId1 = playerId, formationSlots)],
+                  c('matchId1','teamId1','playerId1')
+               )[, .SD[1, list(teamId = teamId1)], list(SNO = SNO1, matchId = matchId1, playerId = playerId1, formationSlots)],
+            dtPlayers[, list(playerId, matchId, name)],
+            c('playerId', 'matchId')
+          ),
+          dtMatches[, list(matchId, teamId, teamName)],
+          c('matchId', 'teamId')
+      )[,
+          .N,
+        list(playerId, name, teamId, teamName, formationSlots)
+      ][,
+          list(
+             PlayersAppearances = paste(paste(name, N)[rev(order(N))], collapse = '<br>')
+         ),
+         list(
+            formationSlots
+         )
+      ],
+      dtFormationSlotNames[, list(formationSlots, position)],
+      'formationSlots'
+   )[
+      order(position),
+      list(
+         position, PlayersAppearances
+      )
+   ]
+))
+
+```
+
+
+## Team Candidates For Comparison
+
+```{r FindingBestMatches, cache=FALSE, echo=FALSE, warning=FALSE, message=FALSE, fig.width = 15, fig.height = 8, results = 'asis'}
+
+dtTeamMatches = dtDistanceSummary[
+   # matchId1 %in% viMatchIds
+   SNO1 %in% dtSNOMapping[
+      Tournament %in% c(
+         "EPL201819",
+         "UCLKO201819","UCLGroup201819",
+         ""
+      )
+   ][
+      matchId %in% dtFormationSets[
+         formationName == 4231
+      ][
+         teamId == iTeamId
+      ][,
+         sort(unique(matchId))
+      ]
+   ][
+      teamId %in% c(iTeamId)
+   ][,
+      unique(SNO)
+   ]
+][
+   Match == T
+][, 
+   list(
+      sumDistance = 11 * sum(Distance) / .N, 
+      maxDistance = max(Distance)
+   ),
+   list(matchId1, matchId2, teamId1, teamId2, SNO1, SNO2)
+][
+   sumDistance > 0
+][
+   # teamId2 != iTeamId
+   matchId1 != matchId2
+]
+
+
+dtTeamMatches = merge(
+   merge(
+      dtTeamMatches,
+      dtMatches[, list(teamId1 = oppositionTeamId, matchId1 = matchId, oppositionTeamName1 = teamName, where1 = WhereOpposition)],
+      c('teamId1','matchId1')
+   ),
+   dtMatches[, list(teamId2 = oppositionTeamId, matchId2 = matchId, oppositionTeamName2 = teamName, where2 = WhereOpposition)],
+   c('teamId2','matchId2')
+)
+
+# keep the closest match with each spurs match and discard the rest
+dtTeamMatchesShortlist = dtTeamMatches[,
+   .SD[which.min(sumDistance)],
+   list(
+      matchId1,
+      teamId1,
+      teamId2
+   )
+]
+
+# the set of closest matches should at least be a few in number
+# these are the teams that get excluded
+# dtMatches[teamId %in% dtTeamMatches[
+#    !teamId2 %in% dtTeamMatches[, length(unique(matchId2)), teamId2][V1 >= 0.5 * length(viMatchIds), teamId2], unique(teamId2)
+# ], .SD[1], teamId]
+# dtTeamMatches = dtTeamMatches[
+#    teamId2 %in% dtTeamMatches[, length(unique(matchId2)), teamId2][V1 >= 0.5 * length(viMatchIds), teamId2]
+# ]
+
+dtTeamMatchesShortlist[, teamName2 := NULL]
+dtTeamMatchesShortlist = merge(
+    dtTeamMatchesShortlist, 
+    dtMatches[, list(teamId2 = as.integer(teamId), matchId2 = as.integer(matchId), teamName2 = teamName)]
+)
+dtTeamMatchesShortlist[,
+    teamName2Factor := factor(
+        teamName2,
+        dtTeamMatchesShortlist[, median(sumDistance), teamName2][order(V1), teamName2],
+        ordered = T
+    )
+]
+
+dtTeamMatchesForPlots = dtTeamMatchesShortlist[teamName2Factor %in% sort(unique(teamName2Factor))]
+
+```
+
+My sample set for other teams, including Benfica, includes some tournaments across Europe from the 2018/19 season, namely - 
+
+`r dtSNOMapping[matchId %in% dtDistanceSummary[, c(matchId1, matchId2)], paste(sort(unique(Tournament)), collapse = '<br>')]`. 
+
+For both teams in each match in any of these tournaments, I calculate the distances from the games listed as the Spurs basline and I will base my analysis on that. In total, there are `r dtDistanceSummary[, length(unique(teamName2))]` teams being considered.  
+
+
+## Comparisons
+
+Below is the distribution of distances between Spurs baseline games compared to all the games and the the distribution of distances only between pairs of Spurs baseline games. There is clearly some similarity amongst the second set, given how the distances between them are mostly much lower compared to the distance between the first set. However, the second set has some larger distances within it too which indicates that there are variations amongst the Tottenham baseline games as well.
+
+```{r goodTeamMatchesWithinTottenham, cache=FALSE, echo=FALSE, warning=FALSE, message=FALSE, fig.width = 15, fig.height = 8, results = 'asis'}
+
+# ggplot(dtTeamMatches[SNO1 %in% viTeamSNOs & SNO2 %in% viTeamSNOs]) + geom_tile(aes(x = paste(oppositionTeamName1, where1), y = paste(oppositionTeamName2, where2), fill = sumDistance)) + coord_fixed()
+
+if ( F ) {
+   
+   ggplot() + 
+      geom_bar(
+         data = dtTeamMatches[
+            SNO1 %in% viTeamSNOs & SNO2 %in% viTeamSNOs
+         ][
+            SNO1 != SNO2
+         ][, 
+            .N, 
+            list(
+              sumDistance = 25 * ( sumDistance %/% 25)
+            )
+         ][,
+            N_pct := N / sum(N)
+         ],
+         aes(
+            x = sumDistance,
+            y = N_pct,
+            fill = 'OtherTottenham4231s'
+         ),
+         stat = 'identity',
+         alpha = 0.75
+      ) + 
+      geom_bar(
+         data = dtTeamMatches[
+            # SNO1 %in% viTeamSNOs & SNO2 %in% viTeamSNOs
+         ][
+            SNO1 != SNO2
+         ][, 
+            .N, 
+            list(
+              sumDistance = 25 * ( sumDistance %/% 25)
+            )
+         ][,
+            N_pct := N / sum(N)
+         ],
+         aes(
+            x = sumDistance,
+            y = N_pct,
+            fill = 'All'
+         ),
+         stat = 'identity',
+         alpha = 0.75
+      ) +
+      scale_y_continuous(
+         labels = percent
+      )
+
+}
+
+ggplot() + 
+   geom_bar(
+      data = rbind(
+          dtTeamMatches[
+         # SNO1 %in% viTeamSNOs & SNO2 %in% viTeamSNOs
+      ][
+         SNO1 != SNO2
+      ][, 
+         .N, 
+         list(
+           sumDistance = 25 * ( sumDistance %/% 25)
+         )
+      ][,
+         N_pct := N / sum(N)
+      ][, Category := 'Spurs Baseline\ncompared to\nall'],
+      dtTeamMatches[
+         SNO1 %in% viTeamSNOs & SNO2 %in% viTeamSNOs
+      ][
+         SNO1 != SNO2
+      ][, 
+         .N, 
+         list(
+           sumDistance = 25 * ( sumDistance %/% 25)
+         )
+      ][,
+         N_pct := N / sum(N)
+      ][, Category := 'Spurs Baseline\ncompared to\nSpurs Baseline']
+      ),
+      aes(
+         x = sumDistance,
+         y = N_pct,
+         # fill = Category
+      ),
+      stat = 'identity',
+      alpha = 0.75,
+      position = 'dodge'
+   ) + 
+   scale_y_continuous(
+      labels = percent
+   ) + 
+   facet_grid(Category~., ) + 
+   ggtitle('Distribution of distances between games') +
+   xlab('Distance') + 
+   ylab('Proportion of game comparisons')
+
+
+```
+
+Amongst the games that the other teams played, here are some teams which had many different games very similar to the way Spurs have played in these matches -
+
+```{r goodTeamMatches, cache=FALSE, echo=FALSE, warning=FALSE, message=FALSE, fig.width = 15, fig.height = 8, results = 'asis'}
+
+print(kable(
+   dtTeamMatchesForPlots[
+      teamName2Factor %in% (sort(unique(teamName2Factor))[1:20]) & 
+      sumDistance < dtTeamMatches[, quantile(sumDistance, 0.1)], 
+      list(
+         N = length(unique(matchId2)),
+         games = paste(unique(paste0( oppositionTeamName2, ' (', where2, ')')), collapse = ', ')
+      ),
+      list(teamName2Factor, teamName2)
+   ][
+      N > 4
+   ][
+      order(teamName2Factor),
+      list(teamName = teamName2, games)
+   ]
+))
+
+```
+
+It makes sense for Spurs to be on the list, obviously, but more importantly Benfica is on the list too. ( Phew! )
+
+```{r goodGameMatches, cache=FALSE, echo=FALSE, warning=FALSE, message=FALSE, fig.width = 15, fig.height = 8, results = 'asis'}
+
+if ( F ) {
+      
+   print(
+      kable(
+         dtTeamMatchesForPlots[, 
+            .SD[which.min(sumDistance)], 
+            SNO1
+         ][, 
+           list(
+              game1 = paste(oppositionTeamName1, where1), 
+              teamName2,oppositionTeamName2, where2
+            )
+         ]
+      )
+   )
+   
+}
+
+```
+
+
+I narrowed the comparison for each team down to the closest performance that each team in my sample set had to each of the 9 baseline performances. If we can find a team which played their matches in such a way that each of the Spurs baseline performance had at least one low distance comparison by this team under consideration then we can consider that team to be a good candidate to train against. 
+
+For comparisons with Spurs themselves, I had to exclude comparing the same game with itself since that would have had a distance of 0 and been the closest match.
+
+The chart below is a distribution of the distance between each team's closest game to the respective baseline Spurs' game. For instance, if there are 100 teams being compared to Spurs, each of the baseline games has 100 points in its distribution, where each point is the closest distance game we could find for that team to that particular Spurs game.
+
+I've highlighted Spurs and Benfica. Note how Benfica's games are generally amongst the smaller distances to the Spurs' game compared to the rest of the distribution. There may be other teams that are even closer than Benfica, some of the other teams from the table above, fo instance, but Benfica still has some very similar games.
+
+```{r plotBenficaTottenhamDistancess, cache=FALSE, echo=FALSE, warning=FALSE, message=FALSE, fig.width = 15, fig.height = 8, results = 'asis'}
+
+ggplot() +
+   geom_jitter(
+      data = dtTeamMatchesForPlots[!teamName2 %in% c('Benfica','Tottenham')],
+      # data = dtTeamMatchesForPlots[!teamName2 %in% as.character(sort(unique(teamName2Factor))[1:20])],
+      aes(
+         x = paste0(oppositionTeamName1,' (',where1,')'), 
+         y = sumDistance,
+         # color = teamName2Factor
+      ),
+      width = 0.1,
+      alpha = 0.1
+   ) +
+   geom_jitter(
+      data = dtTeamMatchesForPlots[teamName2 %in% c('Benfica','Tottenham')],
+      # data = dtTeamMatchesForPlots[teamName2 %in% as.character(sort(unique(teamName2Factor))[1:20])],
+      aes(
+         x = paste0(oppositionTeamName1,' (',where1,')'), 
+         y = sumDistance,
+         color = teamName2
+      ),
+      width = 0.1,
+      size = 3
+   ) +
+   # geom_jitter(
+   #    data = dtTeamMatches[SNO1 %in% viTeamSNOs & SNO2 %in% viTeamSNOs],
+   #    aes(
+   #       x = paste0(oppositionTeamName1,' (',where1,')'), 
+   #       y = sumDistance,
+   #       color = 'Tottenham 4231'
+   #    ),
+   #    width = 0.1
+   # ) +
+   geom_text_repel(
+      data = dtTeamMatchesForPlots[teamName2 %in% c('Benfica','Tottenham')],
+      # data = dtTeamMatchesForPlots[teamName2 %in% as.character(sort(unique(teamName2Factor))[1:20])],
+      aes(
+         x = paste0(oppositionTeamName1,' (',where1,')'), 
+         y = sumDistance,
+         label = paste0(oppositionTeamName2,' (',where2,')')
+      ),
+      hjust = 1
+   ) +
+   theme(
+      axis.text.x = element_text(angle = 90, )
+   ) + 
+   ggtitle('Distribution of the closest ') + 
+   ylab('Distance') + 
+   xlab('Spurs baseline games') + 
+   ggtitle('Distance distribution by position') +
+   xlab('Position') +
+   ylab('Distance')
+
+```
+
+
+```{r FindingBestMatchesAcrossTeams, cache=FALSE, echo=FALSE, warning=FALSE, message=FALSE, fig.width = 15, fig.height = 8, results = 'asis'}
+if ( F ) {
+   
+   merge(
+       merge(
+           merge(
+                merge(
+                   merge(
+                      dtTeamMatchesShortlist[, list(SNO1, SNO2)],
+                      dtDistanceSummary[Match == T],
+                       c('SNO1', 'SNO2')
+                   ),
+                   dtFormationDetails[, list(matchId1 = matchId, teamId1 = teamId, playerId1 = playerId, formationSlots1 = formationSlots)],
+                   c('matchId1','teamId1','playerId1')
+               )[, 
+                  median(Distance), 
+                  list(
+                     formationSlots1,
+                     teamId = teamId2
+                  )
+               ][,
+                  .SD[
+                     which.min(V1),
+                     list(
+                        teamId
+                     )
+                  ], 
+                 formationSlots1
+               ],
+               merge(
+                   merge(
+                      dtTeamMatchesShortlist[, list(SNO1, SNO2)],
+                      dtDistanceSummary[Match == T],
+                       c('SNO1', 'SNO2')
+                   ),
+                   dtFormationDetails[, list(matchId1 = matchId, teamId1 = teamId, playerId1 = playerId, formationSlots1 = formationSlots)],
+                   c('matchId1','teamId1','playerId1')
+               )[,
+                 list(
+                     matchId = unique(matchId2)
+                 ),
+                  list(
+                     teamId = teamId2,
+                     formationSlots1,
+                     playerId = playerId2
+                  )
+               ],
+               c('formationSlots1','teamId')
+           ),
+           dtPlayers[, list(playerId, matchId, name)],
+           c('playerId', 'matchId')
+       ),
+       dtMatches[, list(matchId, teamId, teamName)],
+       c('matchId', 'teamId')
+   )[,
+      .N,
+      list(playerId, name, teamId, teamName, formationSlots1)
+   ][,
+      paste(paste(name, N), collapse = ', '),
+      list(
+         teamId, teamName, formationSlots1
+      )
+   ]
+}
+
+
+```
+
+From these set of games for Benfica, here is a representation of which positions contribute more to the distance. Since the number of points that have to be plotted is much higher, given we're plotting players now and not just teams, I've chosen to replace them with percentile bands. The specific players for Spurs and Benfica games are highlighted.
+
+As expected, the attacking roles generally have higher distances than the rest of the team. In Benfica's case, except for the front four, the rest of the roles in the team are at a pretty small distance compared to other distances amongst their roles too.
+
+```{r PlayerMatches, cache=FALSE, echo=FALSE, warning=FALSE, message=FALSE, fig.width = 15, fig.height = 8, results = 'asis'}
+
+dtPositionPercentiles = merge(
+   merge(
+      dtDistanceSummary[
+         SNO1 != SNO2
+      ][
+         !is.infinite(Distance)
+      ],
+      dtFormationDetails[, list(matchId1 = matchId, teamId1 = teamId, playerId1 = playerId, formationSlots1 = formationSlots)],
+      c('matchId1','teamId1','playerId1')
+   )[
+      Match == T,
+      list(
+         Qile = seq(5,95,10) / 100,
+         Distance = quantile(Distance, seq(5,95,10) / 100)
+      ),
+      formationSlots1
+   ],
+   dtFormationSlotNames[, list(formationSlots1 = formationSlots, position1 = position)],
+   'formationSlots1'
+)
+
+ggplot() + 
+   # geom_jitter(
+   #    data = merge(
+   #       dtDistanceSummary[
+   #          SNO1 != SNO2
+   #       ][
+   #          !is.infinite(Distance)
+   #       ],
+   #       dtFormationDetails[, list(matchId1 = matchId, teamId1 = teamId, playerId1 = playerId, formationSlots1 = formationSlots)],
+   #       c('matchId1','teamId1','playerId1')
+   #    )[
+   #       Match == T
+   #    ][, 
+   #       # list(
+   #       #    Qile = c(0:10) / 10, 
+   #       #    Distance = quantile(Distance, c(0:10) / 10)
+   #       # ), 
+   #       # formationSlots1
+   #    ], 
+   #    aes(
+   #       x = formationSlots1, 
+   #       y = Distance, 
+   #       # group = Qile
+   #    ),
+   #    width = 0.1,
+   #    alpha = 0.05
+   # ) + 
+   geom_line(
+      data = dtPositionPercentiles,
+      aes(
+         x = position1,
+         y = Distance,
+         group = Qile
+      )
+   ) +
+   geom_text(
+      data = dtPositionPercentiles[position1 == sort(position1)[1]],
+      aes(
+         x = position1,
+         y = Distance,
+         label = paste0(round(100 * Qile, 2), "%")
+      ),
+      hjust = 1.5
+   ) +
+   geom_jitter(
+      data = merge(
+         merge(
+            merge(
+               dtTeamMatchesShortlist[
+                  teamId2 %in% dtMatches[
+                     teamName == 'Benfica',
+                     teamId[1]
+                  ], 
+                  list(SNO1, SNO2)
+               ], 
+               dtDistanceSummary[Match == T], 
+               c('SNO1','SNO2')
+            ),
+            dtFormationDetails[, list(matchId1 = matchId, teamId1 = teamId, playerId1 = playerId, formationSlots1 = formationSlots)],
+            c('matchId1','teamId1','playerId1')
+         ),
+         dtFormationSlotNames[, list(formationSlots1 = formationSlots, position1 = position)],
+         c('formationSlots1')
+      ),
+      aes(
+         x = position1, 
+         y = Distance, 
+         color = 'Benfica'
+      ), 
+      width = 0.1
+   ) + 
+   geom_jitter(
+      data = merge(
+         merge(
+            merge(
+               dtTeamMatchesShortlist[
+                  teamId2 %in% dtMatches[
+                     teamName == 'Tottenham',
+                     teamId[1]
+                  ], 
+                  list(SNO1, SNO2)
+               ], 
+               dtDistanceSummary[Match == T], 
+               c('SNO1','SNO2')
+            ),
+            dtFormationDetails[, list(matchId1 = matchId, teamId1 = teamId, playerId1 = playerId, formationSlots1 = formationSlots)],
+            c('matchId1','teamId1','playerId1')
+         ),
+         dtFormationSlotNames[, list(formationSlots1 = formationSlots, position1 = position)],
+         c('formationSlots1')
+      ),
+      aes(
+         x = position1, 
+         y = Distance, 
+         color = 'Tottenham'
+      ),
+      width = 0.1
+   ) +
+   ggtitle('Distance by position') +
+   xlab('Position') +
+   ylab('Distance')
+   
+```
+
+The counts of the Benfica players that get paired with the corresponding matching slot to the Spurs games are as below -
+
+```{r BenficaComposition, cache=FALSE, echo=FALSE, warning=FALSE, message=FALSE, fig.width = 15, fig.height = 8, results = 'asis'}
+
+
+print(kable(
+   merge(
+      merge(
+         merge(
+            merge(
+               dtDistanceSummary[
+                  Match == T
+               ],
+               dtTeamMatchesShortlist[teamName2 == 'Benfica', list(SNO1, SNO2)],
+               c('SNO1','SNO2')
+            ),
+            dtFormationDetails[, list(matchId1 = matchId, teamId1 = teamId, playerId1 = playerId, formationSlots1 = formationSlots)],
+            c('matchId1','teamId1','playerId1')
+         ),
+         dtMatches[, list(matchId2 = matchId, teamId2 = teamId, teamName)],
+         c('matchId2', 'teamId2')
+      )[,
+         .N,
+         list(playerId2, name2, teamId2, teamName2, formationSlots1)
+      ][,
+          list(
+             playersAppearances = paste(paste(name2, N)[rev(order(N))], collapse = '<br>')
+         ),
+         list(
+            formationSlots1
+         )
+      ],
+      dtFormationSlotNames[, list(formationSlots1 = formationSlots, position)],
+      'formationSlots1'
+   )[
+      order(position),
+      list(
+         position, playersAppearances
+      )
+   ]
+))
+
+
+```
+
+
+## Player to Player Comparisons
+
+We can use the same logic to understand how the players playing differently specifically.
+
+First, let's pick up a random game and see which Spurs players are paired with which Benfica player -
+
+```{r SampleMatchAnalysis, cache=FALSE, echo=FALSE, warning=FALSE, message=FALSE, fig.width = 15, fig.height = 8, results = 'asis'}
+
+dtSampleMatchAnalysis = merge(
+   merge(
+      merge(
+          merge(    
+              merge(
+                  merge(
+                      dtDistanceSummary,
+                      dtTeamMatchesShortlist[teamName2 == 'Benfica'][order(sumDistance)][round(.N/2), list(SNO1, SNO2)],
+                      c('SNO1','SNO2')
+                  )[Match == T],
+                  dtPlayers[, list(matchId1 = matchId, playerId1 = playerId, name1 = name)],
+                  c('matchId1','playerId1')
+              ),
+              dtMatches[, list(teamId1 = oppositionTeamId, matchId1 = matchId, oppositionTeamName1 = teamName, where1 = WhereOpposition)],
+              c('teamId1','matchId1')
+          ),
+          dtMatches[, list(teamId2 = oppositionTeamId, matchId2 = matchId, oppositionTeamName2 = teamName, where2 = WhereOpposition)],
+          c('teamId2','matchId2')
+      ),
+      dtFormationDetails[, list(matchId1 = matchId, teamId1 = teamId, playerId1 = playerId, formationSlots1 = formationSlots)][formationSlots1 != 0],
+      c('matchId1','teamId1','playerId1')
+   ),
+   dtFormationSlotNames[, list(formationSlots1 = formationSlots, position1 = position)],
+   'formationSlots1'
+)
+
+print(kable(
+   dtSampleMatchAnalysis[
+      order(position1),
+      list(position1, name1, oppositionTeamName1, where1, name2, oppositionTeamName2, where2, Distance)
+   ]
+))
+
+```
+
+The underlying methodology also allows us identify what sort of passes and movement contributed a large increase in the distance and what sort of passes didn't contribute much to the distance. By reviewing these actions and the associated distances, we can give very clear instructions about what the player needs to do more of and what the player needs to do less of.
+
+As an example, let's take this comparison -
+
+```{r SampleMatchPlayer, cache=FALSE, echo=FALSE, warning=FALSE, message=FALSE, fig.width = 15, fig.height = 8, results = 'asis'}
+
+dtSampleMatchPlayerAnalysis = dtSampleMatchAnalysis[which.max(Distance)]
+      
+dtPasses1 = dtPasses[matchId == dtSampleMatchPlayerAnalysis[, matchId1]]
+dtPasses2 = dtPasses[matchId == dtSampleMatchPlayerAnalysis[, matchId2]]
+cPlayerID1 = dtSampleMatchPlayerAnalysis[, playerId1]
+cPlayerID2 = dtSampleMatchPlayerAnalysis[, playerId2]
+
+
+print(
+   kable(
+      dtSampleMatchPlayerAnalysis[,
+         list(position1, name1, oppositionTeamName1, where1, name2, oppositionTeamName2, where2, Distance)
+      ]
+   )
+)
+```
+
+Here is a chart of where these two players received the ball from.
+
+Some observations:
+
+- Rafa receives the ball on the right wing in the middle of the pitch more often than Lucas Moura.
+
+- Rafa received a long ball from the left flank to the right flank, which was not something that happened to Moura.
+
+- Lucas Moura received a couple of medium to long passes on the left flank which isn't something that happened to Rafa.
+
+```{r distanceReceive, cache=FALSE, echo=FALSE, warning=FALSE, message=FALSE, fig.width = 15, fig.height = 8, results = 'asis'}
+
+dtCombinations = merge(
+   dtPasses1[
+      receivingPlayerId == cPlayerID1,
+      list(
+         x, y, endX, endY,
+         SNO1 = .I,
+         k = 'k'
+      )
+   ][,
+      .SD[
+         complete.cases(.SD)
+      ]
+   ],
+   dtPasses2[
+      receivingPlayerId == cPlayerID2,
+      list(
+         x, y, endX, endY,
+         SNO2 = .I,
+         k = 'k'
+      )
+   ][,
+      .SD[
+         complete.cases(.SD)
+      ]
+   ],
+   by = 'k',
+   suffixes = c('1','2'),
+   allow.cartesian = T
+)
+
+if ( nrow(dtCombinations) > 0 ) {
+
+   dtCombinations[, 
+      Distance := (
+         (
+            ( x1 - x2 ) ^ 2
+         ) +
+         (
+            ( y1 - y2 ) ^ 2
+         ) +
+         (
+            ( endX1 - endX2 ) ^ 2
+         ) +
+         (
+            ( endY1 - endY2 ) ^ 2
+         ) + 
+         0
+      ) ^ 0.5
+   ]
+
+   # dtCombinations = dtCombinations[,
+   #    list(
+   #       SNO1, SNO2, Distance
+   #    )
+   # ]
+
+}
+
+lprecReceive = fEMDDetailed(
+   dtCombinations[, SNO1],
+   dtCombinations[, SNO2],
+   dtCombinations[, Distance]
+)
+
+dtCombinations[, Pairing := get.variables(lprecReceive)]
+
+dtCombinationsReceive = copy(dtCombinations)
+rm(dtCombinations)
+
+
+p1 = ggplot(
+    rbind(
+      dtCombinationsReceive[,
+         list(
+            name = dtSampleMatchPlayerAnalysis[, name1], 
+            Distance = sum(Distance * Pairing)
+         ),
+         list(SNO = SNO1, x = x1, y = y1, endX = endX1, endY = endY1)
+      ],
+      dtCombinationsReceive[,
+         list(
+            name = dtSampleMatchPlayerAnalysis[, name2],
+            Distance = sum(Distance * Pairing)
+         ),
+         list(SNO = SNO2, x = x2, y = y2, endX = endX2, endY = endY2)
+      ]
+   )
+) 
+p1 = fAddPitchLines(p1, nXLimit = 105, nYLimit = 68)
+p1 = p1 + 
+   geom_segment(
+      aes(
+         x = x,
+         y = y,
+         xend = endX,
+         yend = endY,
+         color = Distance
+      ),
+      arrow = arrow(length = unit(0.03, "npc"))
+   ) + 
+   scale_colour_continuous(
+      low = 'black',
+      high = 'red'
+   ) +
+   # coord_fixed(
+   #    ylim = c(0,80),
+   #    xlim = c(0,120)
+   # ) + 
+   ggtitle('Receiving Pass') + 
+   facet_wrap(~name) + 
+   theme_pitch()
+
+print(p1)
+
+```
+
+- Moura makes a couple of movements from the right flank around the centre of the pitch headed to the back, which Rafa doesn't.
+
+- Rafa's activity in the middle of the pitch on the right flank show up again as a difference between him and Moura.
+
+```{r distanceMovement, cache=FALSE, echo=FALSE, warning=FALSE, message=FALSE, fig.width = 15, fig.height = 8, results = 'asis'}
+
+dtPassChain1 = merge(
+   dtPasses1[, 
+      list(
+         x, y, endX, endY, 
+         playerId = receivingPlayerId, 
+         MatchCentreEventIndex,
+         NextMatchCentreEventIndex = c(tail(MatchCentreEventIndex, -1), NA)
+      ),
+      list(
+         matchId, teamId, playId
+      )                                          
+   ],
+   dtPasses1[, 
+      list(
+         x, y, endX, endY,
+         playerId, 
+         matchId, teamId,
+         NextMatchCentreEventIndex = MatchCentreEventIndex
+      )
+   ],
+   c('playerId','matchId','teamId','NextMatchCentreEventIndex'),
+   suffixes = c('Receive','')
+)[
+   playerId == cPlayerID1
+]
+
+dtPassChain2 = merge(
+   dtPasses2[, 
+      list(
+         x, y, endX, endY, 
+         playerId = receivingPlayerId, 
+         MatchCentreEventIndex,
+         NextMatchCentreEventIndex = c(tail(MatchCentreEventIndex, -1), NA)
+      ),
+      list(
+         matchId, teamId, playId
+      )                                          
+   ],
+   dtPasses2[, 
+      list(
+         x, y, endX, endY,
+         playerId, 
+         matchId, teamId,
+         NextMatchCentreEventIndex = MatchCentreEventIndex
+      )
+   ],
+   c('playerId','matchId','teamId','NextMatchCentreEventIndex'),
+   suffixes = c('Receive','')
+)[
+   playerId == cPlayerID2
+]                         
+
+dtPassChain1[, k := 'k']           
+dtPassChain2[, k := 'k']           
+
+dtPassChain1[, SNO1 := .I]           
+dtPassChain2[, SNO2 := .I]           
+
+dtCombinations = merge(
+   dtPassChain1[,
+      .SD[
+         complete.cases(.SD)
+      ]
+   ],
+   dtPassChain2[,
+      .SD[
+         complete.cases(.SD)
+      ]
+   ],
+   by = 'k',
+   suffixes = c('1','2'),
+   allow.cartesian = T
+)
+
+if ( nrow(dtCombinations) ) {
+
+   dtCombinations[, 
+      Distance := (
+         # (
+         #    ( xReceive1 - xReceive2 ) ^ 2
+         # ) +
+         # (
+         #    ( yReceive1 - yReceive2 ) ^ 2
+         # ) +
+         (
+            ( endXReceive1 - endXReceive2 ) ^ 2
+         ) +
+         (
+            ( endYReceive1 - endYReceive2 ) ^ 2
+         ) +
+         (
+            ( x1 - x2 ) ^ 2
+         ) +
+         (
+            ( y1 - y2 ) ^ 2
+         ) +
+         # (
+         #    ( endX1 - endX2 ) ^ 2
+         # ) +
+         # (
+         #    ( endY1 - endY2 ) ^ 2
+         # ) +
+         0
+      ) ^ 0.5
+   ]
+
+}
+
+
+lprecMovement = fEMDDetailed(
+   dtCombinations[, SNO1],
+   dtCombinations[, SNO2],
+   dtCombinations[, Distance]
+)
+
+
+dtCombinations[, Pairing := get.variables(lprecMovement)]
+
+dtCombinationsMovement = copy(dtCombinations)
+rm(dtCombinations)
+
+p1 = ggplot(
+   rbind(
+      dtCombinationsMovement[,
+         list(
+            name = dtSampleMatchPlayerAnalysis[, name1], 
+            Distance = sum(Distance * Pairing)
+         ),
+         list(SNO = SNO1, x = endXReceive1, y = endYReceive1, endX = x1, endY = y1)
+      ],
+      dtCombinationsMovement[,
+         list(
+            name = dtSampleMatchPlayerAnalysis[, name2],
+            Distance = sum(Distance * Pairing)
+         ),
+         list(SNO = SNO2, x = endXReceive2, y = endYReceive2, endX = x2, endY = y2)
+      ]
+   )
+)
+p1 = fAddPitchLines(p1, nXLimit = 105, nYLimit = 68)
+p1 = p1 + 
+   geom_segment(
+      aes(
+         x = x,
+         y = y,
+         xend = endX,
+         yend = endY,
+         color = Distance
+      ),
+      arrow = arrow(length = unit(0.03, "npc"))
+   ) + 
+   scale_colour_continuous(
+      low = 'black',
+      high = 'red'
+   ) +
+   # coord_fixed(
+   #    ylim = c(0,80),
+   #    xlim = c(0,120)
+   # ) + 
+   ggtitle('Movement') + 
+   facet_wrap(~name) + 
+   theme_pitch()
+
+print(p1)
+
+
+```
+
+- Moura has attempted a couple of passes from deep on the left flank to the centre of the pitch, and three passes into the box which seem to be very different from Rafa's
+
+- Rafa's activity neare the middle of the pitch on the right again.
+
+- A couple of passes Rafa played deep into the right corner are very dissimilar to Moura's passes.
+
+```{r distancePass, cache=FALSE, echo=FALSE, warning=FALSE, message=FALSE, fig.width = 15, fig.height = 8, results = 'asis'}
+
+dtCombinations = merge(
+   dtPasses1[
+      playerId == cPlayerID1,
+      list(
+         x, y, endX, endY,
+         SNO1 = .I,
+         k = 'k'
+      )
+   ][,
+      .SD[
+         complete.cases(.SD)
+      ]
+   ],
+   dtPasses2[
+      playerId == cPlayerID2,
+      list(
+         x, y, endX, endY,
+         SNO2 = .I,
+         k = 'k'
+      )
+   ][,
+      .SD[
+         complete.cases(.SD)
+      ]
+   ],
+   by = 'k',
+   suffixes = c('1','2'),
+   allow.cartesian = T
+)
+
+if ( nrow(dtCombinations) > 0 ) {
+
+   dtCombinations[, 
+      Distance := (
+         (
+            ( x1 - x2 ) ^ 2
+         ) +
+         (
+            ( y1 - y2 ) ^ 2
+         ) +
+         (
+            ( endX1 - endX2 ) ^ 2
+         ) +
+         (
+            ( endY1 - endY2 ) ^ 2
+         ) +
+         0
+      ) ^ 0.5
+   ]
+
+
+}
+
+lprecPass = fEMDDetailed(
+   dtCombinations[, SNO1],
+   dtCombinations[, SNO2],
+   dtCombinations[, Distance]
+)
+
+dtCombinations[, Pairing := get.variables(lprecPass)]
+
+dtCombinationsPass = copy(dtCombinations)
+rm(dtCombinations)
+
+p1 = ggplot(
+   rbind(
+      dtCombinationsPass[,
+         list(
+            name = dtSampleMatchPlayerAnalysis[, name1], 
+            Distance = sum(Distance * Pairing)
+         ),
+         list(SNO = SNO1, x = x1, y = y1, endX = endX1, endY = endY1)
+      ],
+      dtCombinationsPass[,
+         list(
+            name = dtSampleMatchPlayerAnalysis[, name2],
+            Distance = sum(Distance * Pairing)
+         ),
+         list(SNO = SNO2, x = x2, y = y2, endX = endX2, endY = endY2)
+      ]
+   )
+)
+p1 = fAddPitchLines(p1, nXLimit = 105, nYLimit = 68)
+p1 = p1 + 
+   geom_segment(
+      aes(
+         x = x,
+         y = y,
+         xend = endX,
+         yend = endY,
+         color = Distance
+      ),
+      arrow = arrow(length = unit(0.03, "npc"))
+   ) + 
+   scale_colour_continuous(
+      low = 'black',
+      high = 'red'
+   ) +
+   # coord_fixed(
+   #    ylim = c(0,80),
+   #    xlim = c(0,120)
+   # ) + 
+   ggtitle('Pass') + 
+   facet_wrap(~name) + 
+   theme_pitch()
+
+print(p1)
+
+
+```
+
+Putting the above points together, one should be able to communicate specific instructions to Rafa and his teammates about what they have to do and what they have to not do for Rafa to play a role more similar to what Moura played.
+
+The same exercise can be repeated for each player pair so that eventually the whole team incorporates the instructions to play more similar to their Spurs counterparts.
+
+A match to match comparison may be too microscopic a view of the differences between the roles but we have multiple games to compare and should be able to collate our observations from all the nine pairs of matches between these two teams and use that.
+
+## Methodology - 2
+
+As an extra step, I applied a similar approach to shots. Instead of the passing coordinates, I took the coordinates and calculated a distance for where they attempted an assist from, attempted an assist to, and attempted a shot from. Since shots are a less frequent event, I pooled all the shots and assists from all the nine pairs of matches for each team being considered and calculated the distance between all of them together. From this I calculated one overall distance by combinging these distances in an Euclidean way, i.e. overall distance = square root of ( ( distance for assist from ^2 ) + ( distance for assist to ^ 2 ) + ( disatnce for shot from ^ 2 ) )
+
+Note - If a match is paired with multiple baseline games of Spurs, then that match is given a proportionate amount of weightage in this analysis, for instance Benfica's games vs Chaves at home is counted twice since it's also paired with two Spurs games.
+
+Benfica again show up very close to the way Spurs attempt assists and shots.
+
+```{r FurtherWork, cache=FALSE, echo=FALSE, warning=FALSE, message=FALSE, fig.width = 15, fig.height = 8, results = 'asis'}
+
+dtShots1 = merge(
+  dtShots,
+  dtTeamMatchesShortlist[, 1, list(teamId = teamId1, matchId = matchId1)],
+  c('matchId','teamId')
+)
+
+
+dtShots2 = merge(
+   dtShots,
+   dtTeamMatchesShortlist[
+     # teamId2 %in% viTeamIds
+     , 
+     1, 
+     list(teamId = teamId2, matchId = matchId2)
+   ],
+   c('matchId','teamId')
+)
+
+
+dtShots1 = dtShots1[, list(teamId, matchId, goalMouthY, goalMouthZ, relatedEventId, x, y)]
+dtShots2 = dtShots2[, list(teamId, matchId, goalMouthY, goalMouthZ, relatedEventId, x, y)]
+
+dtAssists1 = merge(
+    dtShots1[, list(matchId, teamId, MatchCentreEventIndex = relatedEventId)],
+    dtPasses,
+    c('teamId','matchId','MatchCentreEventIndex')
+)
+
+dtAssists2 = merge(
+    dtShots2[, list(matchId, teamId, MatchCentreEventIndex = relatedEventId)],
+    dtPasses,
+    c('teamId','matchId','MatchCentreEventIndex')
+)
+
+
+dtTeamMatchesShortlistWeightage = dtTeamMatchesShortlist[, list(OccurrenceInShortlist = .N), list(matchId2, teamId2)]
+
+dtDistances = data.table(
+   teamId = dtShots2[, unique(teamId)],
+   ShootFromDistance = sapply(
+      dtShots2[, unique(teamId)],
+      function ( cTeamIdBeingCompared ) {
+        
+        emd(
+           as.matrix(dtShots1[!is.na(x)][, list(1/.N, x, y)]),
+           as.matrix(
+               merge(
+                  dtShots2[!is.na(x)][teamId == cTeamIdBeingCompared],
+                  dtTeamMatchesShortlistWeightage[, list(teamId = teamId2, matchId = matchId2, OccurrenceInShortlist)],
+                  c('teamId','matchId')
+               )[,
+                  list(OccurrenceInShortlist/sum(OccurrenceInShortlist), x, y)
+               ]
+            )
+        )
+        
+      }
+   ),
+   AssistFromDistance = sapply(
+      dtShots2[, unique(teamId)],
+      function ( cTeamIdBeingCompared ) {
+        
+        emd(
+            as.matrix(dtAssists1[!is.na(x)][, list(1/.N, x, y)]),
+            as.matrix(
+               merge(
+                  dtAssists2[!is.na(x)][teamId == cTeamIdBeingCompared],
+                  dtTeamMatchesShortlistWeightage[, list(teamId = teamId2, matchId = matchId2, OccurrenceInShortlist)],
+                  c('teamId','matchId')
+               )[,
+                  list(OccurrenceInShortlist/sum(OccurrenceInShortlist), x, y)
+               ]
+            )
+        )
+        
+      }
+   ),
+   AssistToDistance = sapply(
+      dtShots2[, unique(teamId)],
+      function ( cTeamIdBeingCompared ) {
+        
+        emd(
+           as.matrix(dtAssists1[!is.na(x)][, list(1/.N, endX, endY)]),
+           as.matrix(
+               merge(
+                  dtAssists2[!is.na(x)][teamId == cTeamIdBeingCompared],
+                  dtTeamMatchesShortlistWeightage[, list(teamId = teamId2, matchId = matchId2, OccurrenceInShortlist)],
+                  c('teamId','matchId')
+               )[,
+                  list(OccurrenceInShortlist/sum(OccurrenceInShortlist), endX, endY)
+               ]
+            )
+        )
+        
+      }
+   )
+)
+
+dtDistances[, OverallShootingDistance := ( ( ShootFromDistance ^ 2 ) + ( AssistFromDistance ^ 2 ) + ( AssistToDistance ^ 2 ) ) ^ 0.5]
+
+dtDistances = merge(
+   dtDistances,
+   dtMatches[, 
+      list(teamName = teamName[1]), 
+      list(
+         teamId = as.integer(teamId)
+      )
+   ],
+   'teamId'
+)
+
+dtDistances[, teamNameFactor := factor(teamName, levels = teamName[order(OverallShootingDistance)], ordered = T)]
+
+ggplot(dtDistances[!teamName %in% c('Tottenham','Benfica')]) + 
+   geom_jitter(aes(x = 'Shoot From', y = ShootFromDistance ), width = 0.1) + 
+   geom_jitter(aes(x = 'Assist From', y = AssistFromDistance ), width = 0.1) + 
+   geom_jitter(aes(x = 'Assist To', y = AssistToDistance), width = 0.1) + 
+   geom_jitter(aes(x = 'Overall', y = OverallShootingDistance ), width = 0.1) +
+   geom_jitter(data = dtDistances[teamName %in% 'Benfica'], aes(x = 'Shoot From', y = ShootFromDistance, color = 'Benfica' ), size = 3, width = 0.1) +
+   geom_jitter(data = dtDistances[teamName %in% 'Benfica'], aes(x = 'Assist From', y = AssistFromDistance, color = 'Benfica' ), size = 3, width = 0.1) +
+   geom_jitter(data = dtDistances[teamName %in% 'Benfica'], aes(x = 'Assist To', y = AssistToDistance, color = 'Benfica'), size = 3, width = 0.1) +
+   geom_jitter(data = dtDistances[teamName %in% 'Benfica'], aes(x = 'Overall', y = OverallShootingDistance, color = 'Benfica' ), size = 3, width = 0.1) +
+   geom_jitter(data = dtDistances[teamName %in% 'Tottenham'], aes(x = 'Shoot From', y = ShootFromDistance, color = 'Tottenham' ), size = 3, width = 0.1) +
+   geom_jitter(data = dtDistances[teamName %in% 'Tottenham'], aes(x = 'Assist From', y = AssistFromDistance, color = 'Tottenham' ), size = 3, width = 0.1) +
+   geom_jitter(data = dtDistances[teamName %in% 'Tottenham'], aes(x = 'Assist To', y = AssistToDistance, color = 'Tottenham'), size = 3, width = 0.1) +
+   geom_jitter(data = dtDistances[teamName %in% 'Tottenham'], aes(x = 'Overall', y = OverallShootingDistance, color = 'Tottenham' ), size = 3, width = 0.1) +
+   theme(
+      axis.text.x = element_text(angle = 90, hjust = 1)
+   ) +
+   xlab('Distance category') +
+   ylab('Distance') +
+   ggtitle('Distance in assists and shots') + 
+   scale_x_discrete(limits = c('Shoot From', 'Assist To', 'Assist From','Overall'))
+   
+```
+
+One can perform a similar detailed analysis as what we did for the passing similarity to give specific instructions to Benfica's team about where to attempt assists and shots from.
+
+## Conclusion
+
+Given the small distance in their passing styles and the small distance between their shots and assists locations, Benfica may have indeed been a good choice to practice against for a game with Spurs.
+
+## Get in touch
+
+Do you have suggestions, comments, new ideas to build on top of this, etc.? I'd love to hear. Find me on Twitter - <a href="https://twitter.com/thecomeonman">@thecomeonman</a>.
